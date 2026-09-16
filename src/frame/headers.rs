@@ -706,12 +706,21 @@ impl Iterator for Iter {
                 return Some(Method(method));
             }
 
-            if let Some(scheme) = pseudo.scheme.take() {
-                return Some(Scheme(scheme));
-            }
-
+            // `:authority` before `:scheme`, which is Chrome's order and not
+            // h2's. The sequence the pseudo-headers arrive in is part of the
+            // HTTP/2 fingerprint an anti-bot service reads -- it is the last
+            // field of the Akamai fingerprint string -- and `m,s,a,p` says
+            // "not a browser" as loudly as a wrong cipher list does.
+            //
+            // RFC 9113 8.3 requires the pseudo-headers to precede the regular
+            // fields and says nothing about their order relative to each other,
+            // so both orders are conformant; servers accept either.
             if let Some(authority) = pseudo.authority.take() {
                 return Some(Authority(authority));
+            }
+
+            if let Some(scheme) = pseudo.scheme.take() {
+                return Some(Scheme(scheme));
             }
 
             if let Some(path) = pseudo.path.take() {
