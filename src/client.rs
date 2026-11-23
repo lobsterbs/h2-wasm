@@ -1319,10 +1319,27 @@ where
             codec.set_max_recv_header_list_size(max as usize);
         }
 
-        // Send initial settings frame
-        codec
-            .buffer(builder.settings.clone().into())
-            .expect("invalid SETTINGS frame");
+        // Chromium-compatible initial SETTINGS (lyrebird): real Chrome
+        // sends ENABLE_PUSH, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE,
+        // MAX_CONCURRENT_STREAMS in that exact wire order and never
+        // advertises MAX_HEADER_LIST_SIZE on the wire. Keep the builder
+        // settings for local enforcement, but shape the seed frame so the
+        // client's h2 fingerprint matches upstream Chromium.
+        let initial_window = builder
+            .settings
+            .initial_window_size()
+            .unwrap_or(crate::frame::DEFAULT_INITIAL_WINDOW_SIZE);
+        let frame_max = builder
+            .settings
+            .max_frame_size()
+            .unwrap_or(crate::frame::DEFAULT_MAX_FRAME_SIZE);
+        let seed = Settings::from_wire_pairs(vec![
+            (2, 0),
+            (4, initial_window),
+            (5, frame_max),
+            (3, 1024),
+        ]);
+        codec.buffer(seed.into()).expect("invalid SETTINGS frame");
 
         let inner = proto::Connection::new(
             codec,
@@ -1335,6 +1352,7 @@ where
                 remote_reset_stream_max: builder.pending_accept_reset_stream_max,
                 local_error_reset_streams_max: builder.local_max_error_reset_streams,
                 settings: builder.settings.clone(),
+                initial_target_connection_window_size: builder.initial_target_connection_window_size,
             },
         );
         let send_request = SendRequest {
@@ -1342,10 +1360,10 @@ where
             pending: None,
         };
 
-        let mut connection = Connection { inner };
-        if let Some(sz) = builder.initial_target_connection_window_size {
-            connection.set_target_window_size(sz);
-        }
+        // The connection target window is deferred (applied on the first
+        // received DATA frame) so no WINDOW_UPDATE leaves at the handshake,
+        // matching a real Chromium connection profile.
+        let connection = Connection { inner };
 
         Ok((send_request, connection))
     }

@@ -14,6 +14,11 @@ pub struct Settings {
     max_frame_size: Option<u32>,
     max_header_list_size: Option<u32>,
     enable_connect_protocol: Option<u32>,
+    /// Exact wire order override (lyrebird): when set, the encoder writes
+    /// exactly these (setting id, value) pairs, in this order, instead of
+    /// walking the standard slots. Used by the client handshake to match a
+    /// Chromium SETTINGS fingerprint.
+    wire_pairs: Option<Vec<(u16, u32)>>,
 }
 
 /// An enum that lists all valid settings that can be sent in a SETTINGS
@@ -58,6 +63,16 @@ impl Settings {
     pub fn ack() -> Settings {
         Settings {
             flags: SettingsFlags::ack(),
+            ..Settings::default()
+        }
+    }
+
+    /// Create a SETTINGS frame carrying an exact ordered list of
+    /// (setting id, value) pairs; the encoder writes exactly these pairs,
+    /// in order, instead of walking the standard slots.
+    pub fn from_wire_pairs(wire_pairs: Vec<(u16, u32)>) -> Settings {
+        Settings {
+            wire_pairs: Some(wire_pairs),
             ..Settings::default()
         }
     }
@@ -205,6 +220,9 @@ impl Settings {
     }
 
     fn payload_len(&self) -> usize {
+        if let Some(pairs) = &self.wire_pairs {
+            return pairs.len() * 6;
+        }
         let mut len = 0;
         self.for_each(|_| len += 6);
         len
@@ -220,6 +238,13 @@ impl Settings {
         head.encode(payload_len, dst);
 
         // Encode the settings
+        if let Some(pairs) = &self.wire_pairs {
+            for (id, val) in pairs {
+                dst.put_u16(*id);
+                dst.put_u32(*val);
+            }
+            return;
+        }
         self.for_each(|setting| {
             tracing::trace!("encoding setting; val={:?}", setting);
             setting.encode(dst)

@@ -83,6 +83,10 @@ pub(crate) struct Config {
     pub remote_reset_stream_max: usize,
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
+    /// Deferred connection target window (lyrebird): applied on the first
+    /// received DATA frame instead of at the handshake so no WINDOW_UPDATE
+    /// leaves before the response starts flowing.
+    pub initial_target_connection_window_size: Option<WindowSize>,
 }
 
 #[derive(Debug)]
@@ -125,7 +129,10 @@ where
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
             }
         }
-        let streams = Streams::new(streams_config(&config));
+        let mut streams = Streams::new(streams_config(&config));
+        if let Some(size) = config.initial_target_connection_window_size {
+            streams.defer_target_connection_window_size(size);
+        }
         let span = tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         span.follows_from(tracing::Span::current());
         Connection {

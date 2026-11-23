@@ -1505,6 +1505,7 @@ where
                                 .builder
                                 .local_max_error_reset_streams,
                             settings: self.builder.settings.clone(),
+                            initial_target_connection_window_size: None,
                         },
                     );
 

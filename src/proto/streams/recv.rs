@@ -21,6 +21,12 @@ pub(super) struct Recv {
     /// Amount of connection window capacity currently used by outstanding streams.
     in_flight_data: WindowSize,
 
+    /// Deferred connection target window (lyrebird): when set, nothing is
+    /// sent at handshake; the target is applied after the first DATA frame
+    /// arrives on the connection so the resulting WINDOW_UPDATE leaves only
+    /// once the stream is flowing (Chromium sends no handshake WU).
+    deferred_target: Option<WindowSize>,
+
     /// The lowest stream ID that is still idle
     next_stream_id: Result<StreamId, StreamIdOverflow>,
 
@@ -97,6 +103,7 @@ impl Recv {
             init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
             flow,
             in_flight_data: 0 as WindowSize,
+            deferred_target: None,
             next_stream_id: Ok(next_stream_id.into()),
             pending_window_updates: store::Queue::new(),
             last_processed_id: StreamId::ZERO,
@@ -533,6 +540,22 @@ impl Recv {
             self.in_flight_data,
         );
 
+        self.apply_target_connection_window(target)?;
+
+        // If changing the target capacity means we gained a bunch of capacity,
+        // enough that we went over the update threshold, then schedule sending
+        // a connection WINDOW_UPDATE.
+        if self.flow.unclaimed_capacity().is_some() {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a new connection target window; capacity is marked available but
+    /// the WINDOW_UPDATE itself is only flushed by the connection poll loop.
+    fn apply_target_connection_window(&mut self, target: WindowSize) -> Result<(), Reason> {
         // The current target connection window is our `available` plus any
         // in-flight data reserved by streams.
         //
@@ -548,16 +571,14 @@ impl Recv {
         } else {
             self.flow.claim_capacity(current - target)?;
         }
-
-        // If changing the target capacity means we gained a bunch of capacity,
-        // enough that we went over the update threshold, then schedule sending
-        // a connection WINDOW_UPDATE.
-        if self.flow.unclaimed_capacity().is_some() {
-            if let Some(task) = task.take() {
-                task.wake();
-            }
-        }
         Ok(())
+    }
+
+    /// Defer a connection target window (lyrebird, client handshake parity):
+    /// nothing is sent until the first DATA frame arrives, then the target is
+    /// applied and the WINDOW_UPDATE flushes with the normal poll cycle.
+    pub fn defer_target_connection_window(&mut self, target: WindowSize) {
+        self.deferred_target = Some(target);
     }
 
     pub(crate) fn apply_local_settings(
@@ -788,6 +809,14 @@ impl Recv {
 
         // Track the data as in-flight
         self.in_flight_data += sz;
+
+        // First DATA on the connection: apply a deferred target window now so
+        // the WINDOW_UPDATE leaves mid-stream instead of at the handshake.
+        if let Some(target) = self.deferred_target.take() {
+            if self.apply_target_connection_window(target).is_err() {
+                tracing::debug!("applying deferred connection window target failed");
+            }
+        }
         Ok(())
     }
 

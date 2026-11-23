@@ -127,6 +127,15 @@ where
             .set_target_connection_window(size, &mut me.actions.task)
     }
 
+    /// Defer the connection target window (lyrebird): the target is applied
+    /// when the first DATA frame arrives, not at the handshake.
+    pub fn defer_target_connection_window_size(&mut self, size: WindowSize) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        me.actions.recv.defer_target_connection_window(size)
+    }
+
     pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
