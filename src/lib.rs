@@ -128,6 +128,7 @@ pub mod client;
 pub mod ext;
 pub mod server;
 mod share;
+mod wire_profile;
 
 #[cfg(fuzzing)]
 #[cfg_attr(feature = "unstable", allow(missing_docs))]

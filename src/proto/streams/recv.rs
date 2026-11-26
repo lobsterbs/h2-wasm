@@ -5,10 +5,10 @@ use crate::proto;
 
 use http::{HeaderMap, Request, Response};
 
+use instant::Instant;
 use std::cmp::Ordering;
 use std::io;
 use std::task::{Context, Poll, Waker};
-use instant::Instant;
 
 #[derive(Debug)]
 pub(super) struct Recv {
@@ -579,6 +579,19 @@ impl Recv {
     /// applied and the WINDOW_UPDATE flushes with the normal poll cycle.
     pub fn defer_target_connection_window(&mut self, target: WindowSize) {
         self.deferred_target = Some(target);
+    }
+
+    /// Mirror a handshake WINDOW_UPDATE in the flow accounting (lyrebird):
+    /// the frame was buffered by the client handshake next to the seed
+    /// SETTINGS; assigning the same capacity here keeps the poll loop from
+    /// emitting a second update for the same window growth.
+    pub fn apply_handshake_window_update(&mut self, inc: WindowSize) {
+        self.flow
+            .assign_capacity(inc)
+            .expect("invalid handshake window capacity");
+        self.flow
+            .inc_window(inc)
+            .expect("invalid handshake window size");
     }
 
     pub(crate) fn apply_local_settings(

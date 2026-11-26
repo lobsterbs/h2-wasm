@@ -69,4 +69,13 @@ impl StreamDependency {
     pub fn dependency_id(&self) -> StreamId {
         self.dependency_id
     }
+
+    /// Write the 5-byte priority payload (lyrebird): the exclusive bit and
+    /// the dependency id as a u32 big-endian, then the weight byte (the wire
+    /// stores weight minus one).
+    pub(crate) fn save<T: bytes::buf::BufMut>(&self, dst: &mut T) {
+        let exclusive = if self.is_exclusive { 0x8000_0000u32 } else { 0 };
+        dst.put_u32(exclusive | u32::from(self.dependency_id));
+        dst.put_u8(self.weight);
+    }
 }

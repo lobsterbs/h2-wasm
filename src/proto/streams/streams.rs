@@ -136,6 +136,15 @@ where
         me.actions.recv.defer_target_connection_window(size)
     }
 
+    /// Mirror a handshake WINDOW_UPDATE in the flow accounting (lyrebird,
+    /// capture-pinned client profiles); see `Recv::apply_handshake_window_update`.
+    pub fn apply_handshake_window_update(&mut self, inc: WindowSize) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        me.actions.recv.apply_handshake_window_update(inc)
+    }
+
     pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;

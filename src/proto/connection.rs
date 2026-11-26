@@ -593,6 +593,10 @@ where
     pub(crate) fn streams(&self) -> &Streams<B, client::Peer> {
         &self.inner.streams
     }
+
+    pub(crate) fn streams_mut(&mut self) -> &mut Streams<B, client::Peer> {
+        &mut self.inner.streams
+    }
 }
 
 impl<T, B> Connection<T, server::Peer, B>

@@ -191,6 +191,13 @@ impl Mock<frame::Headers> {
         self
     }
 
+    /// Set the PRIORITY flag with the given dependency payload (lyrebird
+    /// wire shapes): the expected frame carries the 5-byte payload.
+    pub fn priority(mut self, exclusive: bool, dependency_id: u32, weight: u8) -> Self {
+        self.0.set_priority(exclusive, dependency_id, weight);
+        self
+    }
+
     pub fn into_fields(self) -> HeaderMap {
         self.0.into_parts().1
     }

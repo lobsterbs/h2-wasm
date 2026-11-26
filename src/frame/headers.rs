@@ -81,6 +81,10 @@ pub struct Iter {
 
     /// Header fields
     fields: header::IntoIter<HeaderValue>,
+
+    /// The pseudo-header wire order (lyrebird): per-profile request pseudo
+    /// order pinned from browser captures; stock m,s,a,p by default.
+    order: crate::wire_profile::PseudoOrder,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -241,6 +245,19 @@ impl Headers {
         self.flags.set_end_stream()
     }
 
+    /// Set the PRIORITY flag with the given dependency payload (lyrebird):
+    /// shapes client HEADERS frames like the pinned browser captures, which
+    /// carry priority on the HEADERS frame itself instead of sending
+    /// separate PRIORITY frames.
+    pub fn set_priority(&mut self, exclusive: bool, dependency_id: u32, weight: u8) {
+        self.stream_dep = Some(StreamDependency::new(
+            StreamId::from(dependency_id),
+            weight,
+            exclusive,
+        ));
+        self.flags.set_priority();
+    }
+
     pub fn is_over_size(&self) -> bool {
         self.header_block.is_over_size
     }
@@ -272,7 +289,7 @@ impl Headers {
     }
 
     pub fn encode(
-        self,
+        mut self,
         encoder: &mut hpack::Encoder,
         dst: &mut EncodeBuf<'_>,
     ) -> Option<Continuation> {
@@ -282,9 +299,17 @@ impl Headers {
         // Get the HEADERS frame head
         let head = self.head();
 
+        // Capture-pinned profiles set the PRIORITY flag; the 5-byte
+        // priority payload leads the frame body (lyrebird).
+        let stream_dep = self.stream_dep.take();
+
         self.header_block
             .into_encoding(encoder)
-            .encode(&head, dst, |_| {})
+            .encode(&head, dst, |dst| {
+                if let Some(dep) = stream_dep {
+                    dep.save(dst);
+                }
+            })
     }
 
     fn head(&self) -> Head {
@@ -700,22 +725,51 @@ impl Iterator for Iter {
 
     fn next(&mut self) -> Option<Self::Item> {
         use crate::hpack::Header::*;
+        use crate::wire_profile::PseudoOrder;
 
         if let Some(ref mut pseudo) = self.pseudo {
+            // Request pseudo headers emit in the profile's wire order
+            // (lyrebird): every order starts with :method, and the response
+            // :status always emits after the request pseudos. Stock h2
+            // order is :method :scheme :authority :path.
             if let Some(method) = pseudo.method.take() {
                 return Some(Method(method));
             }
 
-            if let Some(scheme) = pseudo.scheme.take() {
-                return Some(Scheme(scheme));
-            }
-
-            if let Some(authority) = pseudo.authority.take() {
-                return Some(Authority(authority));
-            }
-
-            if let Some(path) = pseudo.path.take() {
-                return Some(Path(path));
+            match self.order {
+                PseudoOrder::Msap => {
+                    if let Some(scheme) = pseudo.scheme.take() {
+                        return Some(Scheme(scheme));
+                    }
+                    if let Some(authority) = pseudo.authority.take() {
+                        return Some(Authority(authority));
+                    }
+                    if let Some(path) = pseudo.path.take() {
+                        return Some(Path(path));
+                    }
+                }
+                PseudoOrder::Masp => {
+                    if let Some(authority) = pseudo.authority.take() {
+                        return Some(Authority(authority));
+                    }
+                    if let Some(scheme) = pseudo.scheme.take() {
+                        return Some(Scheme(scheme));
+                    }
+                    if let Some(path) = pseudo.path.take() {
+                        return Some(Path(path));
+                    }
+                }
+                PseudoOrder::Mpas => {
+                    if let Some(path) = pseudo.path.take() {
+                        return Some(Path(path));
+                    }
+                    if let Some(authority) = pseudo.authority.take() {
+                        return Some(Authority(authority));
+                    }
+                    if let Some(scheme) = pseudo.scheme.take() {
+                        return Some(Scheme(scheme));
+                    }
+                }
             }
 
             if let Some(protocol) = pseudo.protocol.take() {
@@ -768,6 +822,12 @@ impl HeadersFlag {
 
     pub fn is_priority(&self) -> bool {
         self.0 & PRIORITY == PRIORITY
+    }
+
+    /// Set the PRIORITY flag (lyrebird): client HEADERS frames carry the
+    /// 5-byte priority payload when the wire profile pins one.
+    pub fn set_priority(&mut self) {
+        self.0 |= PRIORITY;
     }
 }
 
@@ -945,6 +1005,7 @@ impl HeaderBlock {
         let headers = Iter {
             pseudo: Some(self.pseudo),
             fields: self.fields.into_iter(),
+            order: crate::wire_profile::client_wire_profile().pseudo_order(),
         };
 
         encoder.encode(headers, &mut hpack);
@@ -1212,5 +1273,142 @@ mod test {
                 }
             );
         }
+    }
+}
+
+// Lyrebird wire-order tests: the request pseudo-header order and the
+// HEADERS priority payload are pinned from the 2026-11-22 browser captures.
+#[cfg(test)]
+mod wire_order_tests {
+    use super::*;
+    use crate::frame;
+    use crate::wire_profile::{set_client_wire_profile, ClientWireProfile};
+
+    struct ProfileGuard;
+
+    impl ProfileGuard {
+        fn new(profile: ClientWireProfile) -> Self {
+            set_client_wire_profile(profile);
+            ProfileGuard
+        }
+    }
+
+    impl Drop for ProfileGuard {
+        fn drop(&mut self) {
+            set_client_wire_profile(ClientWireProfile::Default);
+        }
+    }
+
+    fn request_headers() -> Headers {
+        Headers::new(
+            StreamId::from(1),
+            Pseudo::request(
+                Method::GET,
+                Uri::from_static("https://http2.akamai.com/"),
+                None,
+            ),
+            HeaderMap::new(),
+        )
+    }
+
+    // The Iter order: which pseudo header the encoder emits in which slot.
+    fn iter_order(profile: ClientWireProfile) -> Vec<&'static str> {
+        use crate::hpack::Header;
+        let _g = ProfileGuard::new(profile);
+        let mut iter = Iter {
+            pseudo: Some(Pseudo::request(
+                Method::GET,
+                Uri::from_static("https://http2.akamai.com/"),
+                None,
+            )),
+            fields: HeaderMap::new().into_iter(),
+            order: profile.pseudo_order(),
+        };
+        let mut names = vec![];
+        while let Some(h) = iter.next() {
+            match h {
+                Header::Method(_) => names.push("m"),
+                Header::Scheme(_) => names.push("s"),
+                Header::Authority(_) => names.push("a"),
+                Header::Path(_) => names.push("p"),
+                _ => {}
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn iter_orders_match_the_pinned_captures() {
+        assert_eq!(iter_order(ClientWireProfile::Brave), ["m", "a", "s", "p"]);
+        assert_eq!(iter_order(ClientWireProfile::Firefox), ["m", "p", "a", "s"]);
+        assert_eq!(iter_order(ClientWireProfile::Default), ["m", "s", "a", "p"]);
+        assert_eq!(
+            iter_order(ClientWireProfile::Chromium),
+            ["m", "s", "a", "p"]
+        );
+    }
+
+    #[test]
+    fn brave_headers_frame_carries_priority_payload_and_flag() {
+        let _g = ProfileGuard::new(ClientWireProfile::Brave);
+        let mut headers = request_headers();
+        headers.set_end_stream();
+        headers.set_priority(true, 0, 255);
+        assert!(headers.flags.is_priority());
+
+        // Wire: 9-byte head, then the 5-byte priority payload, then the
+        // HPACK block. Brave pins exclusive dep 0 weight 256 (wire 0xff).
+        let mut encoder = crate::hpack::Encoder::default();
+        let mut dst = BytesMut::new();
+        let limit = frame::HEADER_LEN + 1024;
+        assert!(headers
+            .encode(&mut encoder, &mut (&mut dst).limit(limit))
+            .is_none());
+        let bytes = &dst[..];
+        assert_eq!(bytes[4], 0x25); // END_STREAM | END_HEADERS | PRIORITY
+        assert_eq!(
+            u32::from_be_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]),
+            0x8000_0000
+        );
+        assert_eq!(bytes[13], 0xff);
+        // The declared frame length covers the priority payload too.
+        let frame_len = u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]) as usize;
+        assert_eq!(frame_len + 9, bytes.len());
+    }
+
+    #[test]
+    fn firefox_headers_frame_carries_priority_payload_and_flag() {
+        let _g = ProfileGuard::new(ClientWireProfile::Firefox);
+        let mut headers = request_headers();
+        headers.set_priority(false, 0, 21);
+        let mut encoder = crate::hpack::Encoder::default();
+        let mut dst = BytesMut::new();
+        let limit = frame::HEADER_LEN + 1024;
+        assert!(headers
+            .encode(&mut encoder, &mut (&mut dst).limit(limit))
+            .is_none());
+        let bytes = &dst[..];
+        assert_eq!(bytes[4], 0x24); // END_HEADERS | PRIORITY (no END_STREAM)
+        assert_eq!(
+            u32::from_be_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]),
+            0x0000_0000
+        );
+        assert_eq!(bytes[13], 21);
+    }
+
+    #[test]
+    fn default_headers_frame_has_no_priority() {
+        let _g = ProfileGuard::new(ClientWireProfile::Default);
+        let headers = request_headers();
+        let mut encoder = crate::hpack::Encoder::default();
+        let mut dst = BytesMut::new();
+        let limit = frame::HEADER_LEN + 1024;
+        assert!(headers
+            .encode(&mut encoder, &mut (&mut dst).limit(limit))
+            .is_none());
+        let bytes = &dst[..];
+        assert_eq!(bytes[4], 0x04); // END_HEADERS only
+        let frame_len = u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]) as usize;
+        assert_eq!(frame_len + 9, bytes.len());
     }
 }

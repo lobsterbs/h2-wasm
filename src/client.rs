@@ -137,9 +137,25 @@
 
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
-use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId};
+use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId, WindowUpdate};
 use crate::proto::{self, Error};
 use crate::{FlowControl, PingPong, RecvStream, SendStream};
+
+pub use crate::wire_profile::ClientWireProfile;
+
+/// Set the process-wide client wire profile (lyrebird). The profile is read
+/// at client handshake time, so it shapes every connection established after
+/// the call. Single-threaded wasm hosts set it once at transport init.
+///
+/// - [`ClientWireProfile::Default`]: stock h2 (upstream behavior).
+/// - [`ClientWireProfile::Chromium`]: the Chromium-compatible shape shipped
+///   2026-11-23 (the engine's native voice).
+/// - [`ClientWireProfile::Brave`] / [`ClientWireProfile::Firefox`]: the
+///   capture-pinned browser handshake shapes from lobsterbs/lyrebird
+///   `tools/capture/h2shapes.py`.
+pub fn set_client_wire_profile(profile: ClientWireProfile) {
+    crate::wire_profile::set_client_wire_profile(profile);
+}
 
 use bytes::{Buf, Bytes};
 use http::{uri, HeaderMap, Method, Request, Response, Version};
@@ -1311,37 +1327,88 @@ where
         // Create the codec
         let mut codec = Codec::new(io);
 
-        if let Some(max) = builder.settings.max_frame_size() {
+        // The effective local settings: capture-pinned profiles override the
+        // builder slots so local enforcement matches the advertised wire
+        // values (flow-control accounting must never disagree with the wire).
+        let profile = crate::wire_profile::client_wire_profile();
+        let mut settings = builder.settings.clone();
+
+        let seed = match profile.handshake_shape() {
+            Some(shape) => {
+                settings.set_header_table_size(Some(shape.header_table_size));
+                settings.set_initial_window_size(Some(shape.initial_window_size));
+                if let Some(max) = shape.max_header_list_size {
+                    settings.set_max_header_list_size(Some(max));
+                }
+                if let Some(max) = shape.max_frame_size {
+                    settings.set_max_frame_size(Some(max));
+                }
+                Settings::from_wire_pairs(shape.settings.to_vec())
+            }
+            None => match profile {
+                ClientWireProfile::Chromium => {
+                    // Chromium-compatible initial SETTINGS (lyrebird): real
+                    // Chrome sends ENABLE_PUSH, INITIAL_WINDOW_SIZE,
+                    // MAX_FRAME_SIZE, MAX_CONCURRENT_STREAMS in that exact
+                    // wire order and never advertises MAX_HEADER_LIST_SIZE
+                    // on the wire. Keep the builder settings for local
+                    // enforcement, but shape the seed frame so the client's
+                    // h2 fingerprint matches upstream Chromium.
+                    let initial_window = builder
+                        .settings
+                        .initial_window_size()
+                        .unwrap_or(crate::frame::DEFAULT_INITIAL_WINDOW_SIZE);
+                    let frame_max = builder
+                        .settings
+                        .max_frame_size()
+                        .unwrap_or(crate::frame::DEFAULT_MAX_FRAME_SIZE);
+                    Settings::from_wire_pairs(vec![
+                        (2, 0),
+                        (4, initial_window),
+                        (5, frame_max),
+                        (3, 1024),
+                    ])
+                }
+                // Stock h2: advertise the builder settings verbatim
+                // (upstream behavior).
+                _ => settings.clone(),
+            },
+        };
+
+        if let Some(max) = settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
         }
 
-        if let Some(max) = builder.settings.max_header_list_size() {
+        if let Some(max) = settings.max_header_list_size() {
             codec.set_max_recv_header_list_size(max as usize);
         }
 
-        // Chromium-compatible initial SETTINGS (lyrebird): real Chrome
-        // sends ENABLE_PUSH, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE,
-        // MAX_CONCURRENT_STREAMS in that exact wire order and never
-        // advertises MAX_HEADER_LIST_SIZE on the wire. Keep the builder
-        // settings for local enforcement, but shape the seed frame so the
-        // client's h2 fingerprint matches upstream Chromium.
-        let initial_window = builder
-            .settings
-            .initial_window_size()
-            .unwrap_or(crate::frame::DEFAULT_INITIAL_WINDOW_SIZE);
-        let frame_max = builder
-            .settings
-            .max_frame_size()
-            .unwrap_or(crate::frame::DEFAULT_MAX_FRAME_SIZE);
-        let seed = Settings::from_wire_pairs(vec![
-            (2, 0),
-            (4, initial_window),
-            (5, frame_max),
-            (3, 1024),
-        ]);
         codec.buffer(seed.into()).expect("invalid SETTINGS frame");
 
-        let inner = proto::Connection::new(
+        // Capture-pinned profiles emit the connection WINDOW_UPDATE right
+        // after the seed SETTINGS, exactly as the browsers do at the
+        // handshake; the flow accounting is mirrored below.
+        let handshake_window_update = profile
+            .handshake_shape()
+            .map(|shape| shape.connection_target - crate::frame::DEFAULT_INITIAL_WINDOW_SIZE);
+        if let Some(inc) = handshake_window_update {
+            let wu = WindowUpdate::new(StreamId::zero(), inc);
+            codec
+                .buffer(wu.into())
+                .expect("invalid WINDOW_UPDATE frame");
+        }
+
+        // The deferred connection target (Chromium) is applied on the first
+        // received DATA frame so no WINDOW_UPDATE leaves at the handshake.
+        // Default keeps stock h2 behavior (the builder target applies
+        // immediately after the connection is built). Pinned profiles own
+        // the connection window via the handshake update above.
+        let deferred_target = match profile {
+            ClientWireProfile::Chromium => builder.initial_target_connection_window_size,
+            _ => None,
+        };
+
+        let mut inner = proto::Connection::new(
             codec,
             proto::Config {
                 next_stream_id: builder.stream_id,
@@ -1351,19 +1418,27 @@ where
                 reset_stream_max: builder.reset_stream_max,
                 remote_reset_stream_max: builder.pending_accept_reset_stream_max,
                 local_error_reset_streams_max: builder.local_max_error_reset_streams,
-                settings: builder.settings.clone(),
-                initial_target_connection_window_size: builder.initial_target_connection_window_size,
+                settings,
+                initial_target_connection_window_size: deferred_target,
             },
         );
+        if let Some(inc) = handshake_window_update {
+            // Mirror the buffered handshake WINDOW_UPDATE in the flow
+            // accounting so the connection poll loop does not emit a second
+            // update for the same capacity.
+            inner.streams_mut().apply_handshake_window_update(inc);
+        }
         let send_request = SendRequest {
             inner: inner.streams().clone(),
             pending: None,
         };
 
-        // The connection target window is deferred (applied on the first
-        // received DATA frame) so no WINDOW_UPDATE leaves at the handshake,
-        // matching a real Chromium connection profile.
-        let connection = Connection { inner };
+        let mut connection = Connection { inner };
+        if matches!(profile, ClientWireProfile::Default) {
+            if let Some(sz) = builder.initial_target_connection_window_size {
+                connection.set_target_window_size(sz);
+            }
+        }
 
         Ok((send_request, connection))
     }
@@ -1674,6 +1749,14 @@ impl Peer {
 
         // Create the HEADERS frame
         let mut frame = Headers::new(id, pseudo, headers);
+
+        // Capture-pinned profiles set the PRIORITY flag with the pinned
+        // payload on every client HEADERS frame, matching the browser wire
+        // shape (both 2026-11-22 captures carry priority on HEADERS, not
+        // separate PRIORITY frames).
+        if let Some(priority) = crate::wire_profile::client_wire_profile().headers_priority() {
+            frame.set_priority(priority.exclusive, priority.dependency_id, priority.weight);
+        }
 
         if end_of_stream {
             frame.set_end_stream()
